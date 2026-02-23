@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         TMN 2010 Automation Helper v13.00 beta
+// @name         TMN 2010 Automation Helper v13.09 beta
 // @namespace    http://tampermonkey.net/
-// @version      13.00
-// @description  v13.00 beta + Auto OC/DTM accept, mail content in Telegram alerts
+// @version      13.09
+// @description  v13.09 + Bullet sniper with price cap, human delays, OC/DTM ready alerts, auto-travel
 // @author       You
 // @match        *://www.tmn2010.net/login.aspx*
 // @match        *://www.tmn2010.net/authenticated/*
@@ -62,6 +62,10 @@
       right: 12px !important;
       z-index: 2147483647 !important; /* Maximum z-index to ensure always on top */
       pointer-events: auto !important;
+      visibility: hidden !important; /* Hidden until Bootstrap CSS loads inside Shadow DOM */
+    }
+    #tmn-automation-host.tmn-ready {
+      visibility: visible !important;
     }
   `);
 
@@ -223,7 +227,7 @@
         document.body.appendChild(loginOverlay);
       }
       console.log("[TMN AutoLogin]", message);
-      loginOverlay.textContent = `TMN AutoLogin v13.00\n${message}`;
+      loginOverlay.textContent = `TMN AutoLogin v13.09\n${message}`;
     }
 
     function clearTimers() {
@@ -477,6 +481,39 @@ if (currentPath.includes("/authenticated/")) {
     minHealthThreshold: GM_getValue('minHealthThreshold', 89),
     targetHealth: GM_getValue('targetHealth', 90)
   };
+
+  // ---------------------------
+  // Human-like Delays (anti-detection)
+  // ---------------------------
+  const DELAYS = {
+    quick: [1100, 1900],
+    normal: [1200, 3000],
+    slow: [2500, 6000],
+    error: [5000, 15000]
+  };
+
+  function randomDelay(range = DELAYS.normal) {
+    const r = Array.isArray(range) ? range : DELAYS.normal;
+    const min = Math.max(0, Number(r[0] || 0));
+    const max = Math.max(min, Number(r[1] || min));
+    const u = (Math.random() + Math.random() + Math.random()) / 3;
+    let ms = Math.floor(min + (max - min) * u);
+    ms += Math.floor((Math.random() - 0.5) * 240);
+    if (Math.random() < 0.03) ms += 400 + Math.floor(Math.random() * 1200);
+    return Math.max(0, ms);
+  }
+
+  function humanDelay(range = DELAYS.normal) {
+    return new Promise(resolve => setTimeout(resolve, randomDelay(range)));
+  }
+
+  function humanPause(range = DELAYS.normal, thinkChance = 0.08) {
+    let r = range;
+    if (Math.random() < thinkChance) {
+      r = [Math.max(1800, range[0] * 1.6), Math.max(4200, range[1] * 1.8)];
+    }
+    return humanDelay(r);
+  }
     // ---------------------------
   // Telegram Configuration
   // ---------------------------
@@ -534,7 +571,14 @@ if (currentPath.includes("/authenticated/")) {
     pendingAction: GM_getValue('pendingAction', ''),
     buyingHealth: GM_getValue('buyingHealth', false),
     autoOC: GM_getValue('autoOC', false),
-    autoDTM: GM_getValue('autoDTM', false)
+    autoDTM: GM_getValue('autoDTM', false),
+    autoTravel: GM_getValue('autoTravel', false),
+    lastTravel: GM_getValue('lastTravel', 0),
+    notifyOCDTMReady: GM_getValue('notifyOCDTMReady', true),
+    autoBullets: GM_getValue('autoBullets', false),
+    lastBulletCheck: GM_getValue('lastBulletCheck', 0),
+    bulletPreferFMJ: GM_getValue('bulletPreferFMJ', true),
+    bulletInterval: GM_getValue('bulletInterval', 20) // seconds between checks when on bullet page
   };
 
   let automationPaused = false;
@@ -567,6 +611,13 @@ if (currentPath.includes("/authenticated/")) {
     GM_setValue('buyingHealth', state.buyingHealth);
     GM_setValue('autoOC', state.autoOC);
     GM_setValue('autoDTM', state.autoDTM);
+    GM_setValue('autoTravel', state.autoTravel);
+    GM_setValue('lastTravel', state.lastTravel);
+    GM_setValue('notifyOCDTMReady', state.notifyOCDTMReady);
+    GM_setValue('autoBullets', state.autoBullets);
+    GM_setValue('lastBulletCheck', state.lastBulletCheck);
+    GM_setValue('bulletPreferFMJ', state.bulletPreferFMJ);
+    GM_setValue('bulletInterval', state.bulletInterval);
   }
 
   // ---------------------------
@@ -1863,6 +1914,9 @@ let logoutNotificationSent = false;
 
     // Also update health display
     updateHealthDisplay();
+
+    // Check if OC/DTM just became ready and send Telegram alert
+    try { checkOCDTMReadyAlerts(); } catch (e) {}
   }
 
   function startTimerUpdates() {
@@ -2041,6 +2095,11 @@ let logoutNotificationSent = false;
     return { text: `${mins}m`, color: "red" };
   }
 
+  function canTravel() {
+    const ts = getTravelTimerStatus();
+    return ts && ts.canTravelNormal;
+  }
+
   // ---------------------------
   // Health Monitor Functions
   // ---------------------------
@@ -2074,6 +2133,117 @@ let logoutNotificationSent = false;
   }
 
   // ============================================================
+  // ============================================================
+  // OC/DTM READY TELEGRAM ALERTS (edge-triggered)
+  // ============================================================
+  function checkOCDTMReadyAlerts() {
+    if (!telegramConfig.enabled || !state.notifyOCDTMReady) return;
+    if (state.inJail) return;
+
+    const dtmStatus = getDTMTimerStatus();
+    if (dtmStatus) {
+      const dtmReady = dtmStatus.canDTM === true || (dtmStatus.totalSeconds || 0) <= 0;
+      const lastState = localStorage.getItem('tmnDTMReadyAlertState');
+      if (dtmReady && lastState !== 'ready') {
+        localStorage.setItem('tmnDTMReadyAlertState', 'ready');
+        sendTelegramMessage(
+          '✅ <b>DTM is now READY!</b>\n\n' +
+          `Player: ${state.playerName || 'Unknown'}\n` +
+          `Time: ${new Date().toLocaleString()}\n` +
+          '🚚 Drug Trade Mission is available'
+        );
+      } else if (!dtmReady && lastState === 'ready') {
+        localStorage.setItem('tmnDTMReadyAlertState', 'cooldown');
+      }
+    }
+
+    const ocStatus = getOCTimerStatus();
+    if (ocStatus) {
+      const ocReady = ocStatus.canOC === true || (ocStatus.totalSeconds || 0) <= 0;
+      const lastState = localStorage.getItem('tmnOCReadyAlertState');
+      if (ocReady && lastState !== 'ready') {
+        localStorage.setItem('tmnOCReadyAlertState', 'ready');
+        sendTelegramMessage(
+          '✅ <b>OC is now READY!</b>\n\n' +
+          `Player: ${state.playerName || 'Unknown'}\n` +
+          `Time: ${new Date().toLocaleString()}\n` +
+          '🕵️ Organized Crime is available'
+        );
+      } else if (!ocReady && lastState === 'ready') {
+        localStorage.setItem('tmnOCReadyAlertState', 'cooldown');
+      }
+    }
+  }
+
+  // ============================================================
+  // AUTO TRAVEL SYSTEM
+  // ============================================================
+  async function doTravel() {
+    if (!state.autoTravel || state.inJail || state.isPerformingAction) return;
+
+    const currentPage = getCurrentPage();
+    if (currentPage !== 'travel') return;
+
+    console.log('[TMN][TRAVEL] On travel page, looking for destinations...');
+
+    const pageText = (document.body.textContent || "");
+    // Check if on cooldown
+    if (/(\d+)\s*hours?\s*(\d+)\s*minutes?\s*.*before you can travel/i.test(pageText)) {
+      console.log('[TMN][TRAVEL] Travel on cooldown');
+      const m = pageText.match(/(\d+)\s*hours?\s*(\d+)\s*minutes?/i);
+      if (m) {
+        const totalSec = (parseInt(m[1]) || 0) * 3600 + (parseInt(m[2]) || 0) * 60;
+        localStorage.setItem('tmnTravelTimerStatus', JSON.stringify({
+          canTravelNormal: false, canTravelJet: false,
+          totalSeconds: totalSec, expiresAt: Date.now() + totalSec * 1000
+        }));
+      }
+      state.lastTravel = Date.now();
+      saveState();
+      return;
+    }
+
+    // Find travel buttons
+    const availableButtons = [];
+    const btnIds = ['ctl00_main_btnTravel1','ctl00_main_btnTravel2','ctl00_main_btnTravel3',
+      'ctl00_main_btnTravel4','ctl00_main_btnTravel5','ctl00_main_btnTravel6',
+      'ctl00_main_btnTravel7','ctl00_main_btnTravel8','ctl00_main_btnTravel9','ctl00_main_btnTravel10'];
+    for (const id of btnIds) {
+      const btn = document.getElementById(id);
+      if (btn && !btn.disabled) availableButtons.push(btn);
+    }
+    // Fallback: any submit button with "travel" text
+    if (availableButtons.length === 0) {
+      for (const btn of document.querySelectorAll('input[type="submit"], button')) {
+        const val = ((btn.value || btn.textContent || '') + '').trim().toLowerCase();
+        if (val.includes('travel') && !btn.disabled) availableButtons.push(btn);
+      }
+    }
+
+    if (availableButtons.length === 0) {
+      console.log('[TMN][TRAVEL] No travel buttons found');
+      return;
+    }
+
+    const chosen = availableButtons[Math.floor(Math.random() * availableButtons.length)];
+    const label = (chosen.value || chosen.textContent || 'destination').trim();
+    console.log(`[TMN][TRAVEL] Traveling to: ${label}`);
+
+    state.isPerformingAction = true;
+    updateStatus(`✈️ Traveling to ${label}...`);
+    await humanDelay(DELAYS.quick);
+    chosen.click();
+
+    localStorage.setItem('tmnTravelTimerStatus', JSON.stringify({
+      canTravelNormal: false, canTravelJet: false,
+      totalSeconds: 2700, expiresAt: Date.now() + 2700 * 1000
+    }));
+    state.lastTravel = Date.now();
+    state.isPerformingAction = false;
+    saveState();
+  }
+
+  // ============================================================
   // AUTO OC / DTM MAIL INVITE SYSTEM
   // ============================================================
 
@@ -2082,12 +2252,12 @@ let logoutNotificationSent = false;
   const LS_LAST_DTM_INVITE_MAIL_ID = "tmnLastDTMInviteMailId";
   const LS_LAST_OC_ACCEPT_TS = "tmnLastOCAcceptTs";
   const LS_LAST_DTM_ACCEPT_TS = "tmnLastDTMAcceptTs";
+  const LS_PENDING_DTM_URL = "tmnPendingDTMAcceptURL";
+  const LS_PENDING_OC_URL = "tmnPendingOCAcceptURL";
 
-  // Watcher interval IDs
-  let autoOcWatcherId = null;
-  let autoDtmWatcherId = null;
-  const AUTO_OC_INTERVAL_MS = 600000;  // 10 minutes
-  const AUTO_DTM_INTERVAL_MS = 600000; // 10 minutes
+  // Single unified watcher - no more separate OC/DTM/background watchers racing
+  let unifiedMailWatcherId = null;
+  const MAIL_CHECK_INTERVAL_MS = 120000; // Check every 2 minutes
 
   // --- GM_xmlhttpRequest GET helper (returns html + finalUrl for redirect detection) ---
   function gmGet(url) {
@@ -2157,9 +2327,16 @@ let logoutNotificationSent = false;
     const rows = [...grid.querySelectorAll("tr")].slice(1);
     let best = null;
 
+    console.log(`[TMN][AUTO-DTM] Scanning ${rows.length} mail rows for DTM invites...`);
     for (const r of rows) {
       const rowText = (r.textContent || "").trim();
-      if (!/dtm\s+invitation/i.test(rowText)) continue;
+      // Log first few rows for debugging subject format
+      if (rows.indexOf(r) < 5) {
+        console.log(`[TMN][AUTO-DTM] Mail row ${rows.indexOf(r)}: "${rowText.substring(0, 120)}"`);
+      }
+      // Match various DTM invitation subject formats
+      if (!/dtm\s*invitation|drug\s*trade\s*(mission\s*)?invitation|dtm\s*invite/i.test(rowText)) continue;
+      console.log('[TMN][AUTO-DTM] ✓ Matched DTM invite row:', rowText.substring(0, 100));
 
       const link = [...r.querySelectorAll('a[href*="mailbox.aspx"]')].find(a =>
         /[?&]id=\d+/i.test(a.getAttribute("href") || "")
@@ -2178,25 +2355,53 @@ let logoutNotificationSent = false;
   // --- Open DTM mail and extract accept URL ---
   async function getDTMAcceptURLFromMail(mailHref) {
     const mailURL = toAuthenticatedMailboxURL(mailHref);
+    console.log('[TMN][AUTO-DTM] Fetching mail content from:', mailURL);
     const mailRes = await gmGet(mailURL);
-    if (!/\/authenticated\/mailbox\.aspx/i.test(mailRes.finalUrl)) return null;
+    if (!/\/authenticated\/mailbox\.aspx/i.test(mailRes.finalUrl)) {
+      console.log('[TMN][AUTO-DTM] Redirected away from mailbox:', mailRes.finalUrl);
+      return null;
+    }
 
     const mailDoc = new DOMParser().parseFromString(mailRes.html, "text/html");
 
+    // Log all links in the mail for debugging
+    const allLinks = [...mailDoc.querySelectorAll('a')];
+    console.log(`[TMN][AUTO-DTM] Mail contains ${allLinks.length} links`);
+    allLinks.forEach((a, i) => {
+      const href = a.getAttribute("href") || "";
+      const txt = (a.textContent || "").trim();
+      if (href.includes("organizedcrime") || txt.toLowerCase().includes("accept")) {
+        console.log(`[TMN][AUTO-DTM] Relevant link ${i}: text="${txt}" href="${href}"`);
+      }
+    });
+
     const acceptA = [...mailDoc.querySelectorAll('a[href*="organizedcrime.aspx"]')].find(a => {
       const txt = (a.textContent || "").trim().toLowerCase();
-      if (txt && txt !== "accept") return false;
+      // Accept if text is empty, contains "accept", or is just the URL
+      if (txt && !txt.includes("accept") && !txt.includes("organizedcrime")) return false;
       const h = (a.getAttribute("href") || "").replace(/&amp;/g, "&");
       try {
         const u = new URL(h, location.origin);
+        // New-style: ?act=accept&ocid=... (DTM uses same page)
+        const act = (u.searchParams.get("act") || "").toLowerCase();
+        const ocid = u.searchParams.get("ocid") || "";
+        if (act === "accept" && /^\d+$/.test(ocid)) return true;
+        // Old-style: ?p=dtm&accept=1&id=...
         const p = (u.searchParams.get("p") || "").toLowerCase();
         const accept = u.searchParams.get("accept");
         const id = u.searchParams.get("id") || "";
-        return p === "dtm" && accept === "1" && /^\d+$/.test(id);
+        if (p === "dtm" && accept === "1" && /^\d+$/.test(id)) return true;
+        // Fallback: any accept parameter with an id
+        if (accept === "1" && /^\d+$/.test(id)) return true;
+        return false;
       } catch { return false; }
     });
 
-    if (!acceptA) return null;
+    if (!acceptA) {
+      console.log('[TMN][AUTO-DTM] No accept link found in mail content');
+      return null;
+    }
+    console.log('[TMN][AUTO-DTM] Found accept URL:', acceptA.getAttribute("href"));
     return toAuthenticatedURL(acceptA.getAttribute("href"));
   }
 
@@ -2241,11 +2446,12 @@ let logoutNotificationSent = false;
 
     const acceptA = [...mailDoc.querySelectorAll('a[href*="organizedcrime.aspx"]')].find(a => {
       const txt = (a.textContent || "").trim().toLowerCase();
-      if (txt && txt !== "accept") return false;
+      // Accept if text is empty, contains "accept", or is just the URL
+      if (txt && !txt.includes("accept") && !txt.includes("organizedcrime")) return false;
       const h = (a.getAttribute("href") || "").replace(/&amp;/g, "&");
       try {
         const u = new URL(h, location.origin);
-        // New-style: ?act=accept&ocid=...
+        // New-style: ?act=accept&ocid=...&pos=...
         const act = (u.searchParams.get("act") || "").toLowerCase();
         const ocid = u.searchParams.get("ocid") || "";
         if (act === "accept" && /^\d+$/.test(ocid)) return true;
@@ -2262,96 +2468,372 @@ let logoutNotificationSent = false;
     return toAuthenticatedURL(acceptA.getAttribute("href"));
   }
 
-  // --- Main: Check mail and accept DTM invite ---
-  async function checkMailAndAcceptDTMInvite() {
+  // ============================================================
+  // UNIFIED MAIL WATCHER - Single system handles OC, DTM, and general messages
+  // Runs via gmGet (background HTTP) so works regardless of current page
+  // Stores pending invites in localStorage so they survive page navigations
+  // ============================================================
+
+  // All tracking is now via localStorage - no in-memory state that gets wiped on page nav
+
+  async function unifiedMailCheck() {
     try {
-      if (!state.autoDTM) return;
       if (!tabManager.isMasterTab) return;
+      // Need at least OC/DTM enabled or telegram messages enabled
+      if (!state.autoOC && !state.autoDTM && !(telegramConfig.enabled && telegramConfig.notifyMessages)) return;
 
-      // Only check when DTM is ready
-      const dtm = getDTMTimerStatus();
-      if (dtm && !dtm.canDTM && dtm.totalSeconds > 0) return;
+      const inboxURL = `${location.origin}/authenticated/mailbox.aspx?p=m`;
+      const inboxRes = await gmGet(inboxURL);
+      if (!/\/authenticated\/mailbox\.aspx/i.test(inboxRes.finalUrl)) {
+        console.log('[TMN][MAIL] Redirected away from mailbox - may be logged out');
+        return;
+      }
 
-      // Don't check if jailed or mid-action
-      if (state.inJail || state.isPerformingAction) return;
+      const inboxDoc = new DOMParser().parseFromString(inboxRes.html, "text/html");
+      const grid = inboxDoc.querySelector("#ctl00_main_gridMail");
+      if (!grid) {
+        console.log('[TMN][MAIL] No mail grid found');
+        return;
+      }
 
-      const invite = await findNewestDTMInviteMail();
-      if (!invite || !invite.id) return;
+      const rows = [...grid.querySelectorAll("tr")].slice(1);
+      console.log(`[TMN][MAIL] Scanning ${rows.length} mail rows...`);
 
-      const lastSeen = localStorage.getItem(LS_LAST_DTM_INVITE_MAIL_ID);
-      if (lastSeen && lastSeen === invite.id) return;
+      for (const r of rows) {
+        const link = [...r.querySelectorAll('a[href*="mailbox.aspx"]')].find(a =>
+          /[?&]id=\d+/i.test(a.getAttribute("href") || "")
+        );
+        if (!link) continue;
 
-      const acceptURL = await getDTMAcceptURLFromMail(invite.href);
-      if (!acceptURL) return;
+        const href = link.getAttribute("href") || "";
+        const mailId = parseMailIdFromHref(href);
+        if (!mailId) continue;
 
-      console.log('[TMN][AUTO-DTM] Accepting DTM invite:', acceptURL);
-      localStorage.setItem(LS_LAST_DTM_INVITE_MAIL_ID, invite.id);
-      localStorage.setItem(LS_LAST_DTM_ACCEPT_TS, String(Date.now()));
+        const cells = r.querySelectorAll("td");
+        const rowText = (r.textContent || "").trim();
 
-      // Flag that we need to handle DTM page after navigation
-      localStorage.setItem('tmnPendingDTMHandle', 'true');
+        let sender = "Unknown";
+        let subject = "No subject";
+        if (cells.length >= 2) {
+          sender = (cells[0].textContent || "").trim() || sender;
+          subject = (cells[1].textContent || "").trim() || subject;
+        }
 
-      sendTelegramMessage(
-        '🚚 <b>DTM Invite Accepted!</b>\n\n' +
-        `Player: ${state.playerName || 'Unknown'}\n` +
-        `Time: ${new Date().toLocaleString()}\n\n` +
-        '✅ Navigating to DTM page...'
-      );
+        // Check DTM invite - use localStorage to track if already processed
+        const isDTMInvite = /(dtm\s*invitation|dtm\s*invite|drug\s*trade)/i.test(rowText);
+        if (isDTMInvite && state.autoDTM) {
+          // DEDUP LAYER 1: Cooldown — skip if we already accepted a DTM within last 2 hours
+          const lastDTMAcceptTs = parseInt(localStorage.getItem(LS_LAST_DTM_ACCEPT_TS) || '0', 10);
+          if (lastDTMAcceptTs > 0 && (Date.now() - lastDTMAcceptTs) < 7200000) {
+            console.log(`[TMN][MAIL] DTM invite skipped — already accepted ${Math.round((Date.now() - lastDTMAcceptTs) / 60000)}min ago`);
+            localStorage.setItem(LS_LAST_DTM_INVITE_MAIL_ID, mailId);
+            continue;
+          }
 
-      // Pause automation, navigate, then the page handler will pick it up
-      state.isPerformingAction = true;
-      updateStatus("🚚 Accepting DTM invite...");
-      safeNavigate(acceptURL.replace(location.origin, ''));
+          // DEDUP LAYER 2: Already processing — skip if we have a pending DTM handle
+          if (localStorage.getItem('tmnPendingDTMHandle') === 'true' || localStorage.getItem(LS_PENDING_DTM_URL)) {
+            console.log('[TMN][MAIL] DTM invite skipped — already processing a DTM');
+            localStorage.setItem(LS_LAST_DTM_INVITE_MAIL_ID, mailId);
+            continue;
+          }
+
+          // DEDUP LAYER 3: Mail ID — skip if we've already seen this exact mail
+          const lastSeen = localStorage.getItem(LS_LAST_DTM_INVITE_MAIL_ID);
+          if (lastSeen === mailId) {
+            continue;
+          }
+
+          // DEDUP LAYER 4: Age check — skip if mail is older than 5 minutes
+          const inviteTs = parseTMNDateFromText(rowText);
+          const fiveMinAgo = Date.now() - (5 * 60 * 1000);
+          if (inviteTs > 0 && inviteTs < fiveMinAgo) {
+            console.log(`[TMN][MAIL] DTM invite skipped — old mail (age: ${Math.round((Date.now() - inviteTs) / 60000)}min)`);
+            localStorage.setItem(LS_LAST_DTM_INVITE_MAIL_ID, mailId);
+            continue;
+          }
+
+          // DEDUP LAYER 5: If we can't parse the date, only accept if mail ID is HIGHER than last seen
+          // (mail IDs are sequential — higher = newer)
+          if (inviteTs === 0 && lastSeen && parseInt(mailId) <= parseInt(lastSeen)) {
+            console.log(`[TMN][MAIL] DTM invite skipped — mail ID ${mailId} <= last seen ${lastSeen} (unparseable date)`);
+            continue;
+          }
+
+          // All checks passed — this is a genuinely new DTM invite
+          console.log(`[TMN][MAIL] NEW DTM invite! id=${mailId} subject="${subject}"`);
+          await handleNewDTMInvite(mailId, href);
+          continue;
+        }
+
+        // Check OC invite
+        const isOCInvite = /(organized\s*crime\s*invitation|oc\s*invitation)/i.test(rowText);
+        if (isOCInvite && state.autoOC) {
+          // DEDUP LAYER 1: Cooldown — skip if we already accepted an OC within last 2 hours
+          const lastAcceptTs = parseInt(localStorage.getItem(LS_LAST_OC_ACCEPT_TS) || '0', 10);
+          if (lastAcceptTs > 0 && (Date.now() - lastAcceptTs) < 7200000) {
+            console.log(`[TMN][MAIL] OC invite skipped — already accepted ${Math.round((Date.now() - lastAcceptTs) / 60000)}min ago`);
+            localStorage.setItem(LS_LAST_OC_INVITE_MAIL_ID, mailId);
+            continue;
+          }
+
+          // DEDUP LAYER 2: Already processing — skip if we have a pending OC handle
+          if (localStorage.getItem('tmnPendingOCHandle') === 'true' || localStorage.getItem(LS_PENDING_OC_URL)) {
+            console.log('[TMN][MAIL] OC invite skipped — already processing an OC');
+            localStorage.setItem(LS_LAST_OC_INVITE_MAIL_ID, mailId);
+            continue;
+          }
+
+          // DEDUP LAYER 3: Mail ID — skip if we've already seen this exact mail
+          const lastSeen = localStorage.getItem(LS_LAST_OC_INVITE_MAIL_ID);
+          if (lastSeen === mailId) {
+            continue;
+          }
+
+          // DEDUP LAYER 4: Age check — skip if mail is older than 5 minutes
+          const inviteTs = parseTMNDateFromText(rowText);
+          const fiveMinAgo = Date.now() - (5 * 60 * 1000);
+          if (inviteTs > 0 && inviteTs < fiveMinAgo) {
+            console.log(`[TMN][MAIL] OC invite skipped — old mail (age: ${Math.round((Date.now() - inviteTs) / 60000)}min)`);
+            localStorage.setItem(LS_LAST_OC_INVITE_MAIL_ID, mailId);
+            continue;
+          }
+
+          // DEDUP LAYER 5: If date unparseable, only accept if mail ID is higher than last seen
+          if (inviteTs === 0 && lastSeen && parseInt(mailId) <= parseInt(lastSeen)) {
+            console.log(`[TMN][MAIL] OC invite skipped — mail ID ${mailId} <= last seen ${lastSeen} (unparseable date)`);
+            continue;
+          }
+
+          // All checks passed — this is a genuinely new OC invite
+          console.log(`[TMN][MAIL] NEW OC invite! id=${mailId} subject="${subject}"`);
+          await handleNewOCInvite(mailId, href);
+          continue;
+        }
+
+        // Regular mail - check against last notified ID stored in localStorage
+        if (telegramConfig.enabled && telegramConfig.notifyMessages) {
+          const lastNotifiedId = localStorage.getItem('tmnLastNotifiedMailId');
+
+          // FIRST RUN: If we've never notified before, set the high-water mark
+          // to the newest mail ID so we don't spam about old messages
+          if (lastNotifiedId === null) {
+            // Find the highest mail ID in the inbox and set it as baseline
+            let maxId = 0;
+            for (const row of rows) {
+              const rowLink = [...row.querySelectorAll('a[href*="mailbox.aspx"]')].find(a =>
+                /[?&]id=\d+/i.test(a.getAttribute("href") || "")
+              );
+              if (rowLink) {
+                const rid = parseInt(parseMailIdFromHref(rowLink.getAttribute("href") || "")) || 0;
+                if (rid > maxId) maxId = rid;
+              }
+            }
+            localStorage.setItem('tmnLastNotifiedMailId', String(maxId));
+            console.log(`[TMN][MAIL] First run — initialized lastNotifiedMailId to ${maxId} (skipping ${rows.length} existing)`);
+            break;
+          }
+
+          // Only notify for mails we haven't notified about (compare IDs numerically - higher = newer)
+          if (parseInt(mailId) > parseInt(lastNotifiedId)) {
+            // TIMESTAMP CHECK: Only notify about mails from the last 5 minutes
+            const mailTs = parseTMNDateFromText(rowText);
+            const fiveMinAgo = Date.now() - (5 * 60 * 1000);
+            if (mailTs > 0 && mailTs < fiveMinAgo) {
+              // Old mail — update high-water mark but don't alert
+              console.log(`[TMN][MAIL] Skipping old mail id=${mailId} (age: ${Math.round((Date.now() - mailTs) / 60000)}min)`);
+              localStorage.setItem('tmnLastNotifiedMailId', mailId);
+              continue;
+            }
+
+            console.log(`[TMN][MAIL] New recent mail: id=${mailId} from="${sender}" subject="${subject}"`);
+
+            sendTelegramMessage(
+              `📬 <b>New Message!</b>\n\n` +
+              `Player: ${state.playerName || 'Unknown'}\n` +
+              `Time: ${new Date().toLocaleString()}\n` +
+              `From: ${sender}\n` +
+              `Subject: ${subject}\n\n` +
+              `🔗 Check your mailbox at TMN2010`
+            );
+
+            localStorage.setItem('tmnLastNotifiedMailId', mailId);
+
+            // Try to fetch content
+            setTimeout(async () => {
+              try {
+                const mailText = await fetchLatestMailContent();
+                if (mailText) {
+                  sendTelegramMessage(
+                    `📝 <b>Mail Content:</b>\n<pre>${escapeHtml(mailText.substring(0, 500))}</pre>`
+                  );
+                }
+              } catch (e) {}
+            }, 3000);
+
+            break; // Only notify one new mail per check cycle
+          }
+        }
+      }
+
     } catch (e) {
-      console.warn("[TMN][AUTO-DTM] checkMailAndAcceptDTMInvite error:", e);
-      state.isPerformingAction = false;
+      console.warn("[TMN][MAIL] unifiedMailCheck error:", e);
     }
   }
 
-  // --- Main: Check mail and accept OC invite ---
-  async function checkMailAndAcceptOCInvite() {
+  // --- Handle new DTM invite: always alert, extract URL, store for processing ---
+  async function handleNewDTMInvite(mailId, mailHref) {
     try {
-      if (!state.autoOC) return;
-      if (!tabManager.isMasterTab) return;
+      // Mark as seen immediately to prevent duplicate processing
+      localStorage.setItem(LS_LAST_DTM_INVITE_MAIL_ID, mailId);
+      localStorage.setItem(LS_LAST_DTM_ACCEPT_TS, String(Date.now()));
 
-      // Only check when OC is ready
-      const oc = getOCTimerStatus();
-      if (oc && !oc.canOC && oc.totalSeconds > 0) return;
-
-      // Don't check if jailed or mid-action
-      if (state.inJail || state.isPerformingAction) return;
-
-      const invite = await findNewestOCInviteMail();
-      if (!invite || !invite.id) return;
-
-      const lastSeen = localStorage.getItem(LS_LAST_OC_INVITE_MAIL_ID);
-      if (lastSeen && lastSeen === invite.id) return;
-
-      const acceptURL = await getOCAcceptURLFromMail(invite.href);
-      if (!acceptURL) return;
-
-      console.log('[TMN][AUTO-OC] Accepting OC invite:', acceptURL);
-      localStorage.setItem(LS_LAST_OC_INVITE_MAIL_ID, invite.id);
-      localStorage.setItem(LS_LAST_OC_ACCEPT_TS, String(Date.now()));
-
-      // Flag that we need to handle OC page after navigation
-      localStorage.setItem('tmnPendingOCHandle', 'true');
-
+      // Always send Telegram alert regardless of jail/action state
       sendTelegramMessage(
-        '🕵️ <b>OC Invite Accepted!</b>\n\n' +
+        '📬 <b>New DTM Invitation!</b>\n\n' +
         `Player: ${state.playerName || 'Unknown'}\n` +
         `Time: ${new Date().toLocaleString()}\n\n` +
-        '✅ Navigating to OC page...'
+        (state.inJail ? '⛓ Currently in jail — will auto-accept when released' :
+         state.isPerformingAction ? '⏳ Busy — will auto-accept shortly' :
+         '🚚 Auto-accepting now...')
       );
 
-      // Pause automation, navigate, then the page handler will pick it up
-      state.isPerformingAction = true;
-      updateStatus("🕵️ Accepting OC invite...");
-      safeNavigate(acceptURL.replace(location.origin, ''));
+      // Extract accept URL from the mail
+      const acceptURL = await getDTMAcceptURLFromMail(mailHref);
+      if (!acceptURL) {
+        console.warn('[TMN][MAIL] Could not extract DTM accept URL from mail');
+        sendTelegramMessage('⚠️ <b>DTM invite found but could not extract accept link.</b>\nPlease accept manually.');
+        return;
+      }
+
+      console.log('[TMN][MAIL] DTM accept URL:', acceptURL);
+
+      // Store the URL in localStorage so it survives page navigations
+      localStorage.setItem(LS_PENDING_DTM_URL, acceptURL);
+
+      // DON'T navigate here - mainLoop Priority 2 will pick it up on next tick
+      // This avoids race conditions with concurrent mainLoop navigation
+      console.log('[TMN][MAIL] DTM accept URL stored in localStorage. MainLoop will process it.');
     } catch (e) {
-      console.warn("[TMN][AUTO-OC] checkMailAndAcceptOCInvite error:", e);
-      state.isPerformingAction = false;
+      console.warn('[TMN][MAIL] handleNewDTMInvite error:', e);
     }
+  }
+
+  // --- Handle new OC invite: always alert, extract URL, store for processing ---
+  async function handleNewOCInvite(mailId, mailHref) {
+    try {
+      // Mark as seen immediately
+      localStorage.setItem(LS_LAST_OC_INVITE_MAIL_ID, mailId);
+      localStorage.setItem(LS_LAST_OC_ACCEPT_TS, String(Date.now()));
+
+      // Extract accept URL first so we can show role in alert
+      const acceptURL = await getOCAcceptURLFromMail(mailHref);
+
+      let roleInfo = '';
+      if (acceptURL) {
+        try {
+          const u = new URL(acceptURL);
+          const pos = u.searchParams.get('pos');
+          if (pos) roleInfo = `\nRole: ${pos.replace(/([A-Z])/g, ' $1').trim()}`;
+        } catch {}
+      }
+
+      // Always send Telegram alert
+      sendTelegramMessage(
+        '📬 <b>New OC Invitation!</b>\n\n' +
+        `Player: ${state.playerName || 'Unknown'}\n` +
+        `Time: ${new Date().toLocaleString()}${roleInfo}\n\n` +
+        (state.inJail ? '⛓ Currently in jail — will auto-accept when released' :
+         state.isPerformingAction ? '⏳ Busy — will auto-accept shortly' :
+         '🕵️ Auto-accepting now...')
+      );
+
+      if (!acceptURL) {
+        console.warn('[TMN][MAIL] Could not extract OC accept URL from mail');
+        sendTelegramMessage('⚠️ <b>OC invite found but could not extract accept link.</b>\nPlease accept manually.');
+        return;
+      }
+
+      console.log('[TMN][MAIL] OC accept URL:', acceptURL);
+
+      // Store in localStorage so it survives page navigations
+      localStorage.setItem(LS_PENDING_OC_URL, acceptURL);
+
+      // DON'T navigate here - mainLoop Priority 2 will pick it up on next tick
+      console.log('[TMN][MAIL] OC accept URL stored in localStorage. MainLoop will process it.');
+    } catch (e) {
+      console.warn('[TMN][MAIL] handleNewOCInvite error:', e);
+    }
+  }
+
+  // --- Process stored pending DTM invite (called from mainLoop when free) ---
+  function processPendingDTMInvite() {
+    const acceptURL = localStorage.getItem(LS_PENDING_DTM_URL);
+    if (!acceptURL) return false;
+
+    if (state.inJail || state.isPerformingAction) return false;
+
+    console.log('[TMN][DTM] Processing pending DTM invite:', acceptURL);
+    localStorage.removeItem(LS_PENDING_DTM_URL);
+    localStorage.setItem('tmnPendingDTMHandle', 'true');
+
+    sendTelegramMessage(
+      '🚚 <b>DTM Invite Accepted!</b>\n\n' +
+      `Player: ${state.playerName || 'Unknown'}\n` +
+      `Time: ${new Date().toLocaleString()}\n\n` +
+      '✅ Navigating to DTM page...'
+    );
+
+    state.isPerformingAction = true;
+    state.pendingAction = '';
+    saveState();
+    updateStatus("🚚 Accepting DTM invite...");
+    // Navigate directly - don't use safeNavigate which has jail/action blocks
+    try {
+      const u = new URL(acceptURL);
+      window.location.href = u.pathname + u.search;
+    } catch {
+      window.location.href = acceptURL.replace(/^https?:\/\/[^/]+/, '');
+    }
+    return true;
+  }
+
+  // --- Process stored pending OC invite (called from mainLoop when free) ---
+  function processPendingOCInvite() {
+    const acceptURL = localStorage.getItem(LS_PENDING_OC_URL);
+    if (!acceptURL) return false;
+
+    if (state.inJail || state.isPerformingAction) return false;
+
+    let roleInfo = '';
+    try {
+      const u = new URL(acceptURL);
+      const pos = u.searchParams.get('pos');
+      if (pos) roleInfo = `\nRole: ${pos.replace(/([A-Z])/g, ' $1').trim()}`;
+    } catch {}
+
+    console.log('[TMN][OC] Processing pending OC invite:', acceptURL);
+    localStorage.removeItem(LS_PENDING_OC_URL);
+    localStorage.setItem('tmnPendingOCHandle', 'true');
+
+    sendTelegramMessage(
+      '🕵️ <b>OC Invite Accepted!</b>\n\n' +
+      `Player: ${state.playerName || 'Unknown'}\n` +
+      `Time: ${new Date().toLocaleString()}${roleInfo}\n\n` +
+      '✅ Navigating to OC page...'
+    );
+
+    state.isPerformingAction = true;
+    state.pendingAction = '';
+    saveState();
+    updateStatus("🕵️ Accepting OC invite...");
+    // Navigate directly - don't use safeNavigate which has jail/action blocks
+    try {
+      const u = new URL(acceptURL);
+      window.location.href = u.pathname + u.search;
+    } catch {
+      window.location.href = acceptURL.replace(/^https?:\/\/[^/]+/, '');
+    }
+    return true;
   }
 
   // ============================================================
@@ -2361,8 +2843,33 @@ let logoutNotificationSent = false;
     const pending = localStorage.getItem('tmnPendingOCHandle');
     if (pending !== 'true') return false;
 
+    // Timeout: if pending for more than 5 minutes, clear it (something went wrong)
+    const pendingTs = parseInt(localStorage.getItem('tmnPendingOCHandleTs') || '0', 10);
+    if (pendingTs > 0 && Date.now() - pendingTs > 300000) {
+      console.log('[TMN][AUTO-OC] Pending OC handle timed out after 5 min — clearing');
+      localStorage.removeItem('tmnPendingOCHandle');
+      localStorage.removeItem('tmnPendingOCHandleTs');
+      state.isPerformingAction = false;
+      return false;
+    }
+
     const path = window.location.pathname.toLowerCase();
-    if (!path.includes('organizedcrime.aspx')) return false;
+    if (!path.includes('organizedcrime.aspx')) {
+      // Not on OC page — re-navigate if we have the URL still
+      const retryUrl = localStorage.getItem(LS_PENDING_OC_URL);
+      if (retryUrl) {
+        console.log('[TMN][AUTO-OC] Not on OC page, re-navigating to accept URL');
+        localStorage.removeItem(LS_PENDING_OC_URL);
+        try {
+          const u = new URL(retryUrl);
+          window.location.href = u.pathname + u.search;
+        } catch {
+          window.location.href = retryUrl.replace(/^https?:\/\/[^/]+/, '');
+        }
+        return true;
+      }
+      return false;
+    }
 
     console.log('[TMN][AUTO-OC] On OC page — handling role selection...');
     state.isPerformingAction = true;
@@ -2377,7 +2884,7 @@ let logoutNotificationSent = false;
 
     if (acceptLink) {
       console.log('[TMN][AUTO-OC] Clicking Accept link on page');
-      setTimeout(() => acceptLink.click(), 1500);
+      setTimeout(() => acceptLink.click(), randomDelay(DELAYS.quick));
       return true;
     }
 
@@ -2474,11 +2981,48 @@ let logoutNotificationSent = false;
     const pending = localStorage.getItem('tmnPendingDTMHandle');
     if (pending !== 'true') return false;
 
+    // Timeout: if pending for more than 5 minutes, clear it
+    const pendingTs = parseInt(localStorage.getItem('tmnPendingDTMHandleTs') || '0', 10);
+    if (pendingTs > 0 && Date.now() - pendingTs > 300000) {
+      console.log('[TMN][AUTO-DTM] Pending DTM handle timed out after 5 min — clearing');
+      localStorage.removeItem('tmnPendingDTMHandle');
+      localStorage.removeItem('tmnPendingDTMHandleTs');
+      state.isPerformingAction = false;
+      return false;
+    }
+
     const path = window.location.pathname.toLowerCase();
-    if (!path.includes('organizedcrime.aspx')) return false;
+    if (!path.includes('organizedcrime.aspx')) {
+      // Not on DTM page — re-navigate if we have the URL still
+      const retryUrl = localStorage.getItem(LS_PENDING_DTM_URL);
+      if (retryUrl) {
+        console.log('[TMN][AUTO-DTM] Not on DTM page, re-navigating to accept URL');
+        localStorage.removeItem(LS_PENDING_DTM_URL);
+        try {
+          const u = new URL(retryUrl);
+          window.location.href = u.pathname + u.search;
+        } catch {
+          window.location.href = retryUrl.replace(/^https?:\/\/[^/]+/, '');
+        }
+        return true;
+      }
+      return false;
+    }
 
     console.log('[TMN][AUTO-DTM] On DTM page — handling...');
+    console.log(`[TMN][AUTO-DTM] Page text snippet: "${(document.body.textContent || "").substring(0, 200)}"`);
     state.isPerformingAction = true;
+
+    // Wait briefly for page to fully render (ASP.NET forms can load elements async)
+    if (!document.getElementById('ctl00_main_btnBuyDrugs') &&
+        !document.getElementById('ctl00_main_btnBuyLDrugs') &&
+        !Array.from(document.querySelectorAll('input[type="submit"]')).find(b => /buy/i.test(b.value || ''))) {
+      // Page might not be fully loaded yet — check if "Buy drugs" text exists but button doesn't
+      if (/buy\s*drugs/i.test(document.body.textContent || '')) {
+        console.log('[TMN][AUTO-DTM] Buy drugs text found but button not in DOM yet — will retry next tick');
+        return true; // Retry on next mainLoop cycle
+      }
+    }
 
     // Step 1: Check for Complete DTM button
     const completeBtn =
@@ -2509,53 +3053,140 @@ let logoutNotificationSent = false;
       return true;
     }
 
-    // Step 2: Buy drugs page
+    // Step 2: Buy drugs page — find max amount and buy
     const pageText = document.body.textContent || "";
-    const maxMatch = pageText.match(/maximum amount you can carry is (\d+)/i);
 
-    if (maxMatch) {
-      const maxAmount = parseInt(maxMatch[1], 10);
-      if (!Number.isFinite(maxAmount) || maxAmount <= 0) {
+    // Try multiple patterns to find the max drug amount
+    let maxAmount = 0;
+    const maxPatterns = [
+      /maximum amount you can carry is (\d+)/i,
+      /maximum amount you can buy is (\d+)/i,
+      /maximum amount.*?is (\d+)/i,
+      /you can carry is (\d+)/i,
+      /can buy.*?(\d+)\s*units/i
+    ];
+    for (const pat of maxPatterns) {
+      const m = pageText.match(pat);
+      if (m) { maxAmount = parseInt(m[1], 10); break; }
+    }
+
+    // Fallback: extract units from member table — look for player name with "(X units)"
+    if (!maxAmount && state.playerName) {
+      const playerUnitMatch = pageText.match(new RegExp(state.playerName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '\\s*\\([^)]*?-\\s*(\\d+)\\s*units?\\)', 'i'));
+      if (playerUnitMatch) {
+        maxAmount = parseInt(playerUnitMatch[1], 10);
+        console.log(`[TMN][AUTO-DTM] Got max units from member table: ${maxAmount}`);
+      }
+    }
+
+    console.log(`[TMN][AUTO-DTM] maxAmount=${maxAmount}, playerName="${state.playerName}"`);
+
+    // Find the buy controls — broaden selectors to catch all possible element IDs
+    let drugInput =
+      document.getElementById('ctl00_main_tbDrugLAmount') ||
+      document.getElementById('ctl00_main_tbDrugAmount') ||
+      document.getElementById('ctl00_main_txtDrugAmount') ||
+      document.getElementById('ctl00_main_txtAmount') ||
+      document.querySelector('input[id*="tbDrug"]') ||
+      document.querySelector('input[id*="txtDrug"]') ||
+      document.querySelector('input[id*="Drug"][type="text"]') ||
+      document.querySelector('input[id*="Amount"][type="text"]') ||
+      document.querySelector('input[name*="tbDrug"]') ||
+      document.querySelector('input[name*="txtDrug"]');
+
+    let buyButton =
+      document.getElementById('ctl00_main_btnBuyLDrugs') ||
+      document.getElementById('ctl00_main_btnBuyDrugs') ||
+      document.getElementById('ctl00_main_btnBuy') ||
+      document.querySelector('input[id*="btnBuy"][type="submit"]') ||
+      Array.from(document.querySelectorAll('input[type="submit"],button')).find(b =>
+        /buy\s*drugs/i.test((b.value || b.textContent || '').trim())
+      );
+
+    // Nuclear fallback: find any text input next to the Buy Drugs button
+    if (!drugInput && buyButton) {
+      drugInput = buyButton.parentElement?.querySelector('input[type="text"],input:not([type])') ||
+                  buyButton.closest('div,td,tr,form')?.querySelector('input[type="text"],input:not([type])');
+      if (drugInput) console.log(`[TMN][AUTO-DTM] Found input via Buy button proximity: id="${drugInput.id}"`);
+    }
+
+    // Nuclear fallback 2: if no buy button found by ID, search harder
+    if (!buyButton) {
+      buyButton = Array.from(document.querySelectorAll('input[type="submit"]')).find(b =>
+        /buy/i.test(b.value || '')
+      );
+      if (buyButton) console.log(`[TMN][AUTO-DTM] Found Buy button via text search: id="${buyButton.id}" value="${buyButton.value}"`);
+    }
+
+    // Nuclear fallback 3: no specific selectors worked, grab the ONLY text input on page
+    if (!drugInput && maxAmount > 0) {
+      const allTextInputs = document.querySelectorAll('input[type="text"],input:not([type="submit"]):not([type="hidden"]):not([type="checkbox"]):not([type="radio"]):not([type="button"])');
+      const candidates = Array.from(allTextInputs).filter(i => !i.id.includes('search') && !i.id.includes('chat'));
+      if (candidates.length === 1) {
+        drugInput = candidates[0];
+        console.log(`[TMN][AUTO-DTM] Found sole text input as fallback: id="${drugInput.id}"`);
+      }
+    }
+
+    // Debug logging
+    if (!drugInput || !buyButton) {
+      const allInputs = Array.from(document.querySelectorAll('input'));
+      console.log(`[TMN][AUTO-DTM] DEBUG — drugInput=${!!drugInput}, buyButton=${!!buyButton}, maxAmount=${maxAmount}`);
+      console.log(`[TMN][AUTO-DTM] All inputs on page:`);
+      allInputs.forEach(i => console.log(`  id="${i.id}" type="${i.type}" name="${i.name}" value="${i.value}"`));
+    }
+
+    if (maxAmount > 0 && drugInput && buyButton && !buyButton.disabled) {
+      drugInput.value = String(maxAmount);
+      console.log(`[TMN][AUTO-DTM] Buying ${maxAmount} drugs`);
+      setTimeout(() => {
+        buyButton.click();
+
+        // Set cooldown (buying drugs completes the DTM in some setups)
+        const now = Date.now();
+        const dtmCooldown = {
+          canDTM: false, totalSeconds: 7200, hours: 2, minutes: 0, seconds: 0,
+          message: "DTM completed", lastUpdate: now,
+          expiresAt: now + (7200 * 1000)
+        };
+        storeDTMTimerData(dtmCooldown);
+
         localStorage.removeItem('tmnPendingDTMHandle');
+        localStorage.removeItem('tmnPendingDTMHandleTs');
         state.isPerformingAction = false;
-        return false;
-      }
-
-      const drugInput =
-        document.getElementById('ctl00_main_tbDrugLAmount') ||
-        document.getElementById('ctl00_main_tbDrugAmount') ||
-        document.querySelector('input[id*="tbDrug"][type="text"]');
-
-      const buyButton =
-        document.getElementById('ctl00_main_btnBuyLDrugs') ||
-        document.getElementById('ctl00_main_btnBuyDrugs') ||
-        document.querySelector('input[id*="btnBuy"][type="submit"]') ||
-        Array.from(document.querySelectorAll('input[type="submit"],button')).find(b =>
-          /buy\s*drugs/i.test((b.value || b.textContent || '').trim())
+        updateStatus("✅ DTM drugs bought — resuming automation");
+        sendTelegramMessage(
+          '🚚 <b>DTM Drugs Bought!</b>\n\n' +
+          `Player: ${state.playerName || 'Unknown'}\n` +
+          `Amount: ${maxAmount}\n` +
+          '✅ 2h cooldown started, automation resumed'
         );
+      }, randomDelay(DELAYS.quick));
+      return true;
+    }
 
-      if (drugInput && buyButton && !buyButton.disabled) {
-        drugInput.value = String(maxAmount);
-        console.log(`[TMN][AUTO-DTM] Buying ${maxAmount} drugs`);
-        setTimeout(() => {
-          buyButton.click();
+    // If we found input + button but no amount, try buying with the input already populated
+    if (drugInput && buyButton && !buyButton.disabled && drugInput.value && parseInt(drugInput.value) > 0) {
+      const prefilledAmount = drugInput.value;
+      console.log(`[TMN][AUTO-DTM] Input already has value: ${prefilledAmount}, clicking Buy`);
+      setTimeout(() => {
+        buyButton.click();
+        const now = Date.now();
+        storeDTMTimerData({
+          canDTM: false, totalSeconds: 7200, hours: 2, minutes: 0, seconds: 0,
+          message: "DTM completed", lastUpdate: now, expiresAt: now + (7200 * 1000)
+        });
+        localStorage.removeItem('tmnPendingDTMHandle');
+        localStorage.removeItem('tmnPendingDTMHandleTs');
+        state.isPerformingAction = false;
+        updateStatus("✅ DTM drugs bought — resuming automation");
+      }, randomDelay(DELAYS.quick));
+      return true;
+    }
 
-          // Set cooldown (buying drugs completes the DTM in some setups)
-          const dtmCooldown = { canDTM: false, totalSeconds: 7200, hours: 2, minutes: 0, seconds: 0, message: "DTM completed", lastUpdate: Date.now() };
-          storeDTMTimerData(dtmCooldown);
-
-          localStorage.removeItem('tmnPendingDTMHandle');
-          state.isPerformingAction = false;
-          updateStatus("✅ DTM drugs bought — resuming automation");
-          sendTelegramMessage(
-            '🚚 <b>DTM Drugs Bought!</b>\n\n' +
-            `Player: ${state.playerName || 'Unknown'}\n` +
-            `Amount: ${maxAmount}\n` +
-            '✅ 2h cooldown started, automation resumed'
-          );
-        }, 2000);
-        return true;
-      }
+    // Log what we found for debugging
+    if (buyButton) {
+      console.log(`[TMN][AUTO-DTM] Buy button found but maxAmount=${maxAmount}, drugInput=${!!drugInput}`);
     }
 
     // Check if DTM is already on cooldown
@@ -2573,46 +3204,29 @@ let logoutNotificationSent = false;
     return true;
   }
 
-  // --- OC/DTM Mail Watchers ---
-  function startAutoOCMailWatcher() {
-    stopAutoOCMailWatcher();
-    const tick = async () => {
-      try {
-        if (!state.autoOC || !tabManager.isMasterTab) return;
-        if (state.inJail) return;
-        await checkMailAndAcceptOCInvite();
-      } catch (e) {
-        console.warn("[TMN][AUTO-OC] Watcher tick error:", e);
-      } finally {
-        autoOcWatcherId = setTimeout(tick, AUTO_OC_INTERVAL_MS);
-      }
-    };
-    autoOcWatcherId = setTimeout(tick, 5000); // First check after 5s
+  // --- Unified Mail Watcher start/stop ---
+  function startUnifiedMailWatcher() {
+    stopUnifiedMailWatcher();
+    console.log('[TMN][MAIL] Starting unified mail watcher (checks every 2 min)');
+    // First check after 10s, then every 2 minutes
+    unifiedMailWatcherId = setTimeout(function tick() {
+      unifiedMailCheck().finally(() => {
+        unifiedMailWatcherId = setTimeout(tick, MAIL_CHECK_INTERVAL_MS);
+      });
+    }, 10000);
   }
 
-  function stopAutoOCMailWatcher() {
-    if (autoOcWatcherId) { clearTimeout(autoOcWatcherId); autoOcWatcherId = null; }
+  function stopUnifiedMailWatcher() {
+    if (unifiedMailWatcherId) { clearTimeout(unifiedMailWatcherId); unifiedMailWatcherId = null; }
   }
 
-  function startAutoDTMMailWatcher() {
-    stopAutoDTMMailWatcher();
-    const tick = async () => {
-      try {
-        if (!state.autoDTM || !tabManager.isMasterTab) return;
-        if (state.inJail) return;
-        await checkMailAndAcceptDTMInvite();
-      } catch (e) {
-        console.warn("[TMN][AUTO-DTM] Watcher tick error:", e);
-      } finally {
-        autoDtmWatcherId = setTimeout(tick, AUTO_DTM_INTERVAL_MS);
-      }
-    };
-    autoDtmWatcherId = setTimeout(tick, 8000); // First check after 8s (staggered from OC)
-  }
-
-  function stopAutoDTMMailWatcher() {
-    if (autoDtmWatcherId) { clearTimeout(autoDtmWatcherId); autoDtmWatcherId = null; }
-  }
+  // Legacy aliases so the rest of the code doesn't break
+  function startAutoOCMailWatcher() { /* mainLoop handles mail checks now */ }
+  function stopAutoOCMailWatcher() { /* mainLoop handles mail checks now */ }
+  function startAutoDTMMailWatcher() { /* mainLoop handles mail checks now */ }
+  function stopAutoDTMMailWatcher() { /* mainLoop handles mail checks now */ }
+  function startBackgroundMailCheck() { /* handled by unified */ }
+  function stopBackgroundMailCheck() { /* handled by unified */ }
 
   // ============================================================
   // FETCH LATEST MAIL CONTENT (for Telegram alerts)
@@ -2706,6 +3320,8 @@ let logoutNotificationSent = false;
     if (path.includes('resetscriptcounter.aspx')) return 'captcha';
     if (path.includes('playerproperty.aspx') && search.includes('p=g')) return 'garage';
     if (path.includes('credits.aspx')) return 'credits';
+    if (path.includes('travel.aspx')) return 'travel';
+    if (path.includes('store.aspx') && search.includes('p=b')) return 'bullets';
     return 'other';
   }
 
@@ -2832,6 +3448,13 @@ let logoutNotificationSent = false;
       console.log('Player just got released!');
       updateStatus(`Released from jail!${state.pendingAction ? ` Resuming: ${state.pendingAction}` : ''}`);
       state.needsRefresh = true;
+
+      // Process any pending OC/DTM invites now that we're free (after short delay)
+      const hasPendingDTM = localStorage.getItem(LS_PENDING_DTM_URL);
+      const hasPendingOC = localStorage.getItem(LS_PENDING_OC_URL);
+      if (hasPendingDTM || hasPendingOC) {
+        console.log('[TMN] Released from jail — pending invite will be processed by mainLoop');
+      }
     }
 
     saveState();
@@ -2920,10 +3543,14 @@ let logoutNotificationSent = false;
         GM_setValue('actionStartTime', 0);
         saveState();
         window.location.href = url;
-      }, 1000);
+      }, randomDelay(DELAYS.normal));
       return true;
     } else {
-      window.location.href = url;
+      // Human-like delay before navigation
+      const delay = randomDelay(DELAYS.quick);
+      setTimeout(() => {
+        window.location.href = url;
+      }, delay);
       return false;
     }
   }
@@ -3025,7 +3652,7 @@ let logoutNotificationSent = false;
       state.isPerformingAction = false;
       state.currentAction = '';
       GM_setValue('actionStartTime', 0);
-    }, 3000);
+    }, randomDelay(DELAYS.normal));
   }
 
   function doGTA() {
@@ -3092,30 +3719,33 @@ let logoutNotificationSent = false;
     const randomRadio = availableGTAs[Math.floor(Math.random() * availableGTAs.length)];
     randomRadio.checked = true;
 
-    const stealBtn = document.getElementById('ctl00_main_btnStealACar');
-    if (!stealBtn) {
-      updateStatus("Steal car button not found - resetting action state");
-      state.isPerformingAction = false;
-      state.currentAction = '';
-      state.needsRefresh = true;
-      GM_setValue('actionStartTime', 0);
-      saveState();
-      return;
-    }
-
-    stealBtn.click();
-
-    state.lastGTA = now;
-    state.needsRefresh = true;
-    completePendingAction('gta');
-    saveState();
-    updateStatus("GTA attempted - will refresh page...");
-
+    // Human-like delay between selecting car and clicking steal
     setTimeout(() => {
-      state.isPerformingAction = false;
-      state.currentAction = '';
-      GM_setValue('actionStartTime', 0);
-    }, 3000);
+      const stealBtn = document.getElementById('ctl00_main_btnStealACar');
+      if (!stealBtn) {
+        updateStatus("Steal car button not found - resetting action state");
+        state.isPerformingAction = false;
+        state.currentAction = '';
+        state.needsRefresh = true;
+        GM_setValue('actionStartTime', 0);
+        saveState();
+        return;
+      }
+
+      stealBtn.click();
+
+      state.lastGTA = now;
+      state.needsRefresh = true;
+      completePendingAction('gta');
+      saveState();
+      updateStatus("GTA attempted - will refresh page...");
+
+      setTimeout(() => {
+        state.isPerformingAction = false;
+        state.currentAction = '';
+        GM_setValue('actionStartTime', 0);
+      }, randomDelay(DELAYS.normal));
+    }, randomDelay(DELAYS.quick));
   }
 
   function doBooze() {
@@ -3178,7 +3808,7 @@ let logoutNotificationSent = false;
           state.isPerformingAction = false;
           state.currentAction = '';
           GM_setValue('actionStartTime', 0);
-        }, 3000);
+        }, randomDelay(DELAYS.normal));
         return;
       }
     }
@@ -3208,7 +3838,7 @@ let logoutNotificationSent = false;
         state.isPerformingAction = false;
         state.currentAction = '';
         GM_setValue('actionStartTime', 0);
-      }, 3000);
+      }, randomDelay(DELAYS.normal));
     } else {
       updateStatus("No booze options available");
       state.isPerformingAction = false;
@@ -3250,7 +3880,7 @@ let logoutNotificationSent = false;
         state.currentAction = '';
         GM_setValue('actionStartTime', 0);
         safeNavigate('/authenticated/jail.aspx?' + Date.now());
-      }, 2000);
+      }, randomDelay(DELAYS.quick));
     } else {
       state.lastJail = now;
       saveState();
@@ -3426,7 +4056,7 @@ let logoutNotificationSent = false;
           saveState();
           // Navigate back to crimes page to continue automation instead of reload
           window.location.href = '/authenticated/crimes.aspx?' + Date.now();
-        }, 2500);
+        }, randomDelay(DELAYS.normal));
         return;
       }
     }
@@ -3462,7 +4092,7 @@ let logoutNotificationSent = false;
             saveState();
             // Navigate back to crimes page to continue automation
             window.location.href = '/authenticated/crimes.aspx?' + Date.now();
-          }, 2500);
+          }, randomDelay(DELAYS.normal));
           return;
         }
       }
@@ -3475,6 +4105,130 @@ let logoutNotificationSent = false;
     state.lastGarage = now;
     GM_setValue('actionStartTime', 0);
     saveState();
+  }
+
+  // ---------------------------
+  // Bullet Sniper System
+  // ---------------------------
+  const BULLET_URL = '/authenticated/store.aspx?p=b';
+
+  function getCurrentPage_isBulletStore() {
+    const path = window.location.pathname.toLowerCase();
+    const search = window.location.search.toLowerCase();
+    return path.includes('store.aspx') && search.includes('p=b');
+  }
+
+  function getBulletStock() {
+    const fmjEl = document.getElementById('ctl00_main_lblbullet1');
+    const jhpEl = document.getElementById('ctl00_main_lblbullet2');
+    return {
+      fmj: fmjEl ? parseInt(fmjEl.textContent.replace(/,/g, ''), 10) || 0 : 0,
+      jhp: jhpEl ? parseInt(jhpEl.textContent.replace(/,/g, ''), 10) || 0 : 0
+    };
+  }
+
+  function getBulletMaxQty() {
+    const ownerLink = document.getElementById('ctl00_main_linkowner');
+    if (ownerLink && ownerLink.textContent.trim() === 'System') return 400;
+    return 500;
+  }
+
+  async function doBulletSnipe() {
+    if (!state.autoBullets || state.inJail || state.isPerformingAction || automationPaused) return;
+
+    if (!getCurrentPage_isBulletStore()) return;
+
+    console.log('[TMN][BULLETS] On bullet store page, checking stock...');
+    state.isPerformingAction = true;
+    state.currentAction = 'bullets';
+
+    try {
+      const stock = getBulletStock();
+      console.log(`[TMN][BULLETS] Stock - FMJ: ${stock.fmj}, JHP: ${stock.jhp}`);
+
+      // No bullets available
+      if (stock.fmj === 0 && stock.jhp === 0) {
+        console.log('[TMN][BULLETS] No bullets in stock — will reload and retry');
+        state.lastBulletCheck = Date.now();
+        state.isPerformingAction = false;
+        state.currentAction = '';
+        saveState();
+        updateStatus("🔫 No bullets — refreshing...");
+        // Reload page after delay to check for restock
+        setTimeout(() => {
+          if (state.autoBullets) {
+            window.location.href = BULLET_URL + '&_=' + Date.now();
+          }
+        }, randomDelay([5000, 10000]));
+        return;
+      }
+
+      const maxQty = getBulletMaxQty();
+      const buyBox = document.getElementById('ctl00_main_txtbullets');
+      const buyBtn = document.getElementById('ctl00_main_btnBuyBullets');
+      const typeSel = document.getElementById('ctl00_main_ddlbullettype');
+
+      if (!buyBox || !buyBtn || !typeSel) {
+        console.log('[TMN][BULLETS] Buy controls not found');
+        state.isPerformingAction = false;
+        state.currentAction = '';
+        return;
+      }
+
+      // Decide which type to buy
+      let buyType = null;
+      let buyQty = 0;
+
+      if (state.bulletPreferFMJ && stock.fmj > 0) {
+        buyType = '1'; // FMJ
+        buyQty = Math.min(maxQty, stock.fmj);
+      } else if (!state.bulletPreferFMJ && stock.jhp > 0) {
+        buyType = '2'; // JHP
+        buyQty = Math.min(maxQty, stock.jhp);
+      } else if (stock.fmj > 0) {
+        buyType = '1';
+        buyQty = Math.min(maxQty, stock.fmj);
+      } else if (stock.jhp > 0) {
+        buyType = '2';
+        buyQty = Math.min(maxQty, stock.jhp);
+      }
+
+      if (!buyType || buyQty <= 0) {
+        state.isPerformingAction = false;
+        state.currentAction = '';
+        return;
+      }
+
+      // Select type
+      if (typeSel.value !== buyType) {
+        typeSel.value = buyType;
+        typeSel.dispatchEvent(new Event('change', { bubbles: true }));
+        await humanDelay([200, 500]);
+      }
+
+      // Set quantity
+      buyBox.value = String(buyQty);
+      const typeLabel = buyType === '1' ? 'FMJ' : 'JHP';
+      console.log(`[TMN][BULLETS] Buying ${buyQty} ${typeLabel} bullets`);
+      updateStatus(`🔫 Buying ${buyQty} ${typeLabel}...`);
+
+      await humanDelay(DELAYS.quick);
+      buyBtn.click();
+
+      state.lastBulletCheck = Date.now();
+
+      // After page reloads from the click, check for more
+      setTimeout(() => {
+        state.isPerformingAction = false;
+        state.currentAction = '';
+        saveState();
+      }, randomDelay(DELAYS.normal));
+
+    } catch (err) {
+      console.error('[TMN][BULLETS] Error:', err);
+      state.isPerformingAction = false;
+      state.currentAction = '';
+    }
   }
 
   // ---------------------------
@@ -3492,6 +4246,10 @@ let logoutNotificationSent = false;
     const linkBootstrap = document.createElement('link');
     linkBootstrap.rel = 'stylesheet';
     linkBootstrap.href = 'https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css';
+    linkBootstrap.onload = () => {
+      // Show UI only after Bootstrap CSS is loaded (prevents FOUC)
+      host.classList.add('tmn-ready');
+    };
     shadowRoot.appendChild(linkBootstrap);
 
     const linkIcons = document.createElement('link');
@@ -3532,10 +4290,11 @@ let logoutNotificationSent = false;
     shadowRoot.appendChild(style);
 
     const wrapper = document.createElement('div');
+    wrapper.id = 'tmn-wrapper';
     wrapper.innerHTML = `
       <div class="card">
         <div class="card-header d-flex justify-content-between align-items-center">
-          <strong>TMN Auto v13.00β</strong>
+          <strong>TMN Auto v13.09β</strong>
           <div>
             <button id="tmn-settings-btn" class="btn btn-sm btn-outline-secondary me-1" title="Settings">
               <i class="bi bi-gear"></i>
@@ -3584,6 +4343,18 @@ let logoutNotificationSent = false;
               <div class="form-check form-switch mb-2">
                 <input class="form-check-input" type="checkbox" id="tmn-auto-dtm">
                 <label class="form-check-label" for="tmn-auto-dtm">🚚 Auto DTM</label>
+              </div>
+              <div class="form-check form-switch mb-2">
+                <input class="form-check-input" type="checkbox" id="tmn-auto-travel">
+                <label class="form-check-label" for="tmn-auto-travel">✈️ Auto Travel</label>
+              </div>
+              <div class="form-check form-switch mb-2">
+                <input class="form-check-input" type="checkbox" id="tmn-auto-bullets">
+                <label class="form-check-label" for="tmn-auto-bullets">🔫 Bullet Sniper</label>
+              </div>
+              <div class="form-check form-switch mb-2">
+                <input class="form-check-input" type="checkbox" id="tmn-notify-ocdtm-ready">
+                <label class="form-check-label" for="tmn-notify-ocdtm-ready">🔔 OC/DTM Ready Alerts</label>
               </div>
               <div id="tmn-player-badge" style="font-size:0.85rem;color:#9ca3af; margin-top: 5px;">Player: ${state.playerName || 'Unknown'}</div>
             </div>
@@ -3728,6 +4499,27 @@ let logoutNotificationSent = false;
                 <label class="form-label">Interval (min):
                   <input type="number" id="tmn-garage-interval" class="form-control form-control-sm tmn-compact-input" value="${Math.round(config.garageInterval / 60)}" min="1" max="120">
                 </label>
+              </div>
+
+              <hr style="border-color:#1f2937">
+
+              <h6 style="color:#cbd5e1;">🔫 Bullet Sniper</h6>
+              <div class="mb-3">
+                <small class="text-muted d-block mb-2">Auto-buy bullets from the store when available</small>
+                <div class="d-flex gap-3 flex-wrap mb-2">
+                  <div style="width: 48%;">
+                    <label class="form-label small">Check Interval (sec):</label>
+                    <input type="number" id="tmn-bullet-interval" class="form-control form-control-sm" value="${state.bulletInterval}" min="5" max="120">
+                    <small class="text-muted">Time between restock checks</small>
+                  </div>
+                </div>
+                <div class="form-check form-switch mb-2">
+                  <input class="form-check-input" type="checkbox" id="tmn-bullet-prefer-fmj" ${state.bulletPreferFMJ ? 'checked' : ''}>
+                  <label class="form-check-label" for="tmn-bullet-prefer-fmj">Prefer FMJ over JHP</label>
+                </div>
+                <div class="mb-2 p-2" style="background: rgba(59,130,246,0.1); border: 1px solid rgba(59,130,246,0.3); border-radius: 4px;">
+                  <small style="color: #60a5fa;">ℹ Bullet sniper navigates to the store, checks stock, and buys up to max qty. It runs at lowest priority — only when no other actions are due.</small>
+                </div>
               </div>
 
               <hr style="border-color:#1f2937">
@@ -3892,6 +4684,9 @@ let logoutNotificationSent = false;
     shadowRoot.querySelector("#tmn-auto-garage").checked = state.autoGarage;
     shadowRoot.querySelector("#tmn-auto-oc").checked = state.autoOC;
     shadowRoot.querySelector("#tmn-auto-dtm").checked = state.autoDTM;
+    shadowRoot.querySelector("#tmn-auto-travel").checked = state.autoTravel;
+    shadowRoot.querySelector("#tmn-notify-ocdtm-ready").checked = state.notifyOCDTMReady;
+    shadowRoot.querySelector("#tmn-auto-bullets").checked = state.autoBullets;
 
     // Initialize ALL ON/OFF toggle
     const allToggle = shadowRoot.querySelector("#tmn-auto-all");
@@ -3983,6 +4778,39 @@ let logoutNotificationSent = false;
       }
     });
 
+    shadowRoot.querySelector("#tmn-auto-travel").addEventListener('change', e => {
+      state.autoTravel = e.target.checked;
+      saveState();
+      updateStatus('✈️ Auto Travel ' + (state.autoTravel ? 'Enabled' : 'Disabled'));
+    });
+
+    shadowRoot.querySelector("#tmn-notify-ocdtm-ready").addEventListener('change', e => {
+      state.notifyOCDTMReady = e.target.checked;
+      saveState();
+      updateStatus('🔔 OC/DTM Ready Alerts ' + (state.notifyOCDTMReady ? 'Enabled' : 'Disabled'));
+      // Reset alert states so they can fire again
+      if (e.target.checked) {
+        localStorage.removeItem('tmnDTMReadyAlertState');
+        localStorage.removeItem('tmnOCReadyAlertState');
+      }
+    });
+
+    shadowRoot.querySelector("#tmn-auto-bullets").addEventListener('change', e => {
+      state.autoBullets = e.target.checked;
+      saveState();
+      updateStatus('🔫 Bullet Sniper ' + (state.autoBullets ? 'Enabled' : 'Disabled'));
+    });
+
+    // Bullet settings in settings modal
+    shadowRoot.querySelector('#tmn-bullet-interval').addEventListener('change', e => {
+      state.bulletInterval = Math.max(5, parseInt(e.target.value) || 20);
+      saveState();
+    });
+    shadowRoot.querySelector('#tmn-bullet-prefer-fmj').addEventListener('change', e => {
+      state.bulletPreferFMJ = e.target.checked;
+      saveState();
+    });
+
     // ALL ON/OFF toggle functionality
     shadowRoot.querySelector("#tmn-auto-all").addEventListener('change', e => {
       const allEnabled = e.target.checked;
@@ -3995,6 +4823,7 @@ let logoutNotificationSent = false;
       state.autoGarage = allEnabled;
       state.autoOC = allEnabled;
       state.autoDTM = allEnabled;
+      // Note: autoBullets and autoTravel NOT included in ALL toggle — they're specialty features
 
       shadowRoot.querySelector("#tmn-auto-crime").checked = allEnabled;
       shadowRoot.querySelector("#tmn-auto-gta").checked = allEnabled;
@@ -4487,7 +5316,7 @@ let logoutNotificationSent = false;
   // ---------------------------
   // Main Loop (WITH JAIL CHECKS ON EVERY PAGE)
   // ---------------------------
-function mainLoop() {
+async function mainLoop() {
     // Tab Manager: STRICT single-tab enforcement
     // Always re-check master status to handle tab switches
     const wasMaster = tabManager.isMasterTab;
@@ -4504,7 +5333,7 @@ function mainLoop() {
     }
 
     if (automationPaused) {
-      setTimeout(mainLoop, 2000);
+      setTimeout(mainLoop, 1800 + Math.floor(Math.random() * 1400));
       return;
     }
 
@@ -4527,7 +5356,7 @@ function mainLoop() {
       } else {
         updateStatus("Script Check detected - All automation PAUSED");
       }
-      setTimeout(mainLoop, 2000);
+      setTimeout(mainLoop, 1800 + Math.floor(Math.random() * 1400));
       return;
     } else {
       // Clear script check flag if we're no longer on the page
@@ -4552,7 +5381,7 @@ function mainLoop() {
     // CRITICAL: Check jail state on EVERY page, not just jail page
     checkJailStateOnAnyPage();
 
-    // Handle pending OC/DTM page actions (weapon selection, drug buying)
+    // ===== PRIORITY 1: Handle pending OC/DTM page actions (we're already on the page) =====
     if (handleOCPageAfterAccept()) {
       setTimeout(mainLoop, 3000);
       return;
@@ -4562,6 +5391,92 @@ function mainLoop() {
       return;
     }
 
+    // ===== PRIORITY 2: Process pending invite accept URLs (navigate to accept page) =====
+    if (!state.inJail && !state.isPerformingAction) {
+      const pendingDTMUrl = localStorage.getItem(LS_PENDING_DTM_URL);
+      if (pendingDTMUrl && state.autoDTM) {
+        console.log('[TMN] Processing pending DTM accept URL:', pendingDTMUrl);
+        localStorage.removeItem(LS_PENDING_DTM_URL);
+        localStorage.setItem('tmnPendingDTMHandle', 'true');
+        localStorage.setItem('tmnPendingDTMHandleTs', String(Date.now()));
+        sendTelegramMessage(
+          '🚚 <b>DTM Invite Accepted!</b>\n\n' +
+          `Player: ${state.playerName || 'Unknown'}\n` +
+          `Time: ${new Date().toLocaleString()}\n\n` +
+          '✅ Navigating to DTM page...'
+        );
+        state.isPerformingAction = true;
+        saveState();
+        updateStatus("🚚 Accepting DTM invite...");
+        // Use URL path+search to avoid origin mismatch (www vs non-www)
+        try {
+          const dtmUrl = new URL(pendingDTMUrl);
+          window.location.href = dtmUrl.pathname + dtmUrl.search;
+        } catch {
+          window.location.href = pendingDTMUrl.replace(/^https?:\/\/[^/]+/, '');
+        }
+        return;
+      }
+
+      const pendingOCUrl = localStorage.getItem(LS_PENDING_OC_URL);
+      if (pendingOCUrl && state.autoOC) {
+        // Don't navigate to OC page while in jail — wait for release
+        if (state.inJail) {
+          console.log('[TMN] Pending OC URL but in jail — waiting for release');
+          // Don't remove the URL, keep it for when we're free
+        } else {
+          console.log('[TMN] Processing pending OC accept URL:', pendingOCUrl);
+          localStorage.removeItem(LS_PENDING_OC_URL);
+          localStorage.setItem('tmnPendingOCHandle', 'true');
+          localStorage.setItem('tmnPendingOCHandleTs', String(Date.now()));
+          let roleInfo = '';
+          try {
+            const u = new URL(pendingOCUrl);
+            const pos = u.searchParams.get('pos');
+            if (pos) roleInfo = `\nRole: ${pos.replace(/([A-Z])/g, ' $1').trim()}`;
+          } catch {}
+          sendTelegramMessage(
+            '🕵️ <b>OC Invite Accepted!</b>\n\n' +
+            `Player: ${state.playerName || 'Unknown'}\n` +
+            `Time: ${new Date().toLocaleString()}${roleInfo}\n\n` +
+            '✅ Navigating to OC page...'
+          );
+          state.isPerformingAction = true;
+          saveState();
+          updateStatus("🕵️ Accepting OC invite...");
+          // Use URL path+search to avoid origin mismatch (www vs non-www)
+          try {
+            const ocUrl = new URL(pendingOCUrl);
+            window.location.href = ocUrl.pathname + ocUrl.search;
+          } catch {
+            window.location.href = pendingOCUrl.replace(/^https?:\/\/[^/]+/, '');
+          }
+          return;
+        }
+      }
+    }
+
+    // ===== PRIORITY 3: Check mail for new invites (integrated into mainLoop, every 2 min) =====
+    // CRITICAL: Must await so the async gmGet completes before mainLoop navigates to another page
+    if ((state.autoOC || state.autoDTM || (telegramConfig.enabled && telegramConfig.notifyMessages))
+        && !state.isPerformingAction && tabManager.isMasterTab) {
+      const lastMailCheck = parseInt(localStorage.getItem('tmnLastMailCheckTs') || '0', 10);
+      const mailCheckNow = Date.now();
+      if (mailCheckNow - lastMailCheck > MAIL_CHECK_INTERVAL_MS) {
+        localStorage.setItem('tmnLastMailCheckTs', String(mailCheckNow));
+        try {
+          await unifiedMailCheck();
+        } catch (e) {
+          console.warn('[TMN][MAIL] check error:', e);
+        }
+        // If mail check stored a pending URL, pick it up immediately
+        if (localStorage.getItem(LS_PENDING_DTM_URL) || localStorage.getItem(LS_PENDING_OC_URL)) {
+          setTimeout(mainLoop, 500);
+          return;
+        }
+      }
+    }
+
     // Update efficiency tracking (non-blocking)
     try {
       efficiencyTracker.update();
@@ -4569,12 +5484,15 @@ function mainLoop() {
       console.warn('Efficiency tracking error:', e);
     }
 
+    // Check OC/DTM ready alerts (edge-triggered)
+    try { checkOCDTMReadyAlerts(); } catch (e) {}
+
     // Check health and buy if needed (high priority - runs before other actions)
     if (state.autoHealth && !state.isPerformingAction) {
       checkAndBuyHealth();
       // If we're buying health, wait for it to complete
       if (state.buyingHealth) {
-        setTimeout(mainLoop, 2000);
+        setTimeout(mainLoop, 1800 + Math.floor(Math.random() * 1400));
         return;
       }
     }
@@ -4583,7 +5501,7 @@ function mainLoop() {
       const currentPage = getCurrentPage();
       const now = Date.now();
 
-      if (!state.autoCrime && !state.autoGTA && !state.autoBooze && !state.autoJail && !state.autoGarage && !state.autoHealth) {
+      if (!state.autoCrime && !state.autoGTA && !state.autoBooze && !state.autoJail && !state.autoGarage && !state.autoHealth && !state.autoTravel && !state.autoOC && !state.autoDTM) {
         if (now % 30000 < 2000) {
           updateStatus("Idle - no automation enabled");
         }
@@ -4600,7 +5518,10 @@ function mainLoop() {
           updateStatus("In jail - checking for release...");
           safeNavigate('/authenticated/jail.aspx?' + Date.now());
         } else {
-          updateStatus(`IN JAIL - waiting for release${state.pendingAction ? ` (will resume ${state.pendingAction})` : ''}`);
+          const hasPendingDTM = localStorage.getItem(LS_PENDING_DTM_URL);
+          const hasPendingOC = localStorage.getItem(LS_PENDING_OC_URL);
+          const pendingInvite = hasPendingDTM ? ' (pending DTM invite)' : hasPendingOC ? ' (pending OC invite)' : '';
+          updateStatus(`IN JAIL - waiting for release${state.pendingAction ? ` (will resume ${state.pendingAction})` : ''}${pendingInvite}`);
         }
       } else {
         // Player is free - proceed with actions
@@ -4708,6 +5629,22 @@ function mainLoop() {
             updateStatus("Navigating to garage (scheduled)...");
             safeNavigate('/authenticated/playerproperty.aspx?p=g&' + Date.now());
           }
+        } else if (state.autoTravel && canTravel()) {
+          // Auto travel - runs when travel cooldown is up
+          if (currentPage === 'travel') {
+            doTravel();
+          } else {
+            updateStatus("Navigating to travel page...");
+            safeNavigate('/authenticated/travel.aspx?' + Date.now());
+          }
+        } else if (state.autoBullets && (now - state.lastBulletCheck >= state.bulletInterval * 1000)) {
+          // Bullet sniper - lowest priority, runs when nothing else is due
+          if (getCurrentPage_isBulletStore()) {
+            doBulletSnipe();
+          } else {
+            updateStatus("🔫 Navigating to bullet store...");
+            safeNavigate(BULLET_URL + '&_=' + Date.now());
+          }
         } else {
           const crimeRemaining = Math.ceil((config.crimeInterval * 1000 - (now - state.lastCrime)) / 1000);
           const gtaRemaining = Math.ceil((config.gtaInterval * 1000 - (now - state.lastGTA)) / 1000);
@@ -4724,7 +5661,7 @@ function mainLoop() {
       }
     }
 
-    setTimeout(mainLoop, 2000);
+    setTimeout(mainLoop, 1800 + Math.floor(Math.random() * 1400));
   }
 
   // ---------------------------
@@ -4747,13 +5684,12 @@ function mainLoop() {
     // Start DTM/OC timer updates
     startTimerUpdates();
 
-    // Start OC/DTM mail watchers if enabled
-    if (state.autoOC) startAutoOCMailWatcher();
-    if (state.autoDTM) startAutoDTMMailWatcher();
+    // NOTE: Mail checking is now integrated into mainLoop (Priority 3) with localStorage-based cooldown.
+    // No separate timer needed — survives page navigations unlike the old setInterval/setTimeout approach.
 
     // Show appropriate status based on tab status
     if (tabManager.isMasterTab) {
-      updateStatus("TMN Auto v13.00β loaded - Master tab (single tab mode)");
+      updateStatus("TMN Auto v13.09β loaded - Master tab (single tab mode)");
     } else {
       updateStatus("⏸ Secondary tab - close this tab or it will remain inactive");
     }
@@ -4764,8 +5700,7 @@ function mainLoop() {
     // Handle page unload - release master status
     window.addEventListener('beforeunload', () => {
       tabManager.releaseMaster();
-      stopAutoOCMailWatcher();
-      stopAutoDTMMailWatcher();
+      stopUnifiedMailWatcher();
     });
 
     // Cross-tab synchronization for running state
