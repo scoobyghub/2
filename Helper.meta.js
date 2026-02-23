@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         TMN 2010 Automation Helper v13.00 beta
+// @name         TMN 2010 Automation Helper v13.09 beta
 // @namespace    http://tampermonkey.net/
-// @version      13.00
-// @description  v13.00 beta + Auto OC/DTM accept, mail content in Telegram alerts
+// @version      13.09
+// @description  v13.09 + Bullet sniper with price cap, human delays, OC/DTM ready alerts, auto-travel
 // @author       You
 // @match        *://www.tmn2010.net/login.aspx*
 // @match        *://www.tmn2010.net/authenticated/*
